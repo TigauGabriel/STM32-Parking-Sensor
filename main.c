@@ -1,168 +1,267 @@
-/*
- * ============================================================================
- * main.c
- *
- * Parking Sensor Project (Practice Placement Preh Romania)
- * Student: Tigau Gabriel-Aurelian
- *
- * Demonstrates using FreeRTOS on an STM32 to read an
- * HC-SR04 sensor and control a buzzer.
- * ============================================================================
- */
+// ============================================================================
+// Proiect: Senzor de parcare cu FreeRTOS
+// Student: Tigau Gabriel-Aurelian
+// Practica: Preh Romania
+// ============================================================================
 
-/* Includes */
 #include "main.h"
-#include "cmsis_os.h" // For FreeRTOS
-#include "tim.h"      // For TIM6 (micros) and TIM2 (PWM Buzzer)
-#include "gpio.h"     // For TRIG and ECHO pins
+#include "cmsis_os.h"
 
-/* Timer Handles (assumed to be defined by CubeIDE) */
-extern TIM_HandleTypeDef htim2; // Timer for Buzzer PWM
-extern TIM_HandleTypeDef htim6; // Timer for micros() function
+// Timerele pe care le folosim: TIM2 face PWM pentru buzzer, TIM6 e pt delay in microsecunde
+TIM_HandleTypeDef htim2;  
+TIM_HandleTypeDef htim6;  
 
-/* Pin Definitions */
-// TRIG Pin: PA9
-// ECHO Pin: PA8
+// Handle-urile pentru cele 2 task-uri din FreeRTOS
+osThreadId_t sensorTaskHandle;
+osThreadId_t buzzerTaskHandle;
 
-/* Task Function Prototypes */
-void StartTrigTask(void *argument);
-void StartMeasureTask(void *argument);
+// Variabila globala in care salvam distanta. 
+// E volatile ca sa nu o optimizeze compilatorul, fiind folosita in ambele task-uri
+volatile uint32_t current_distance_cm = 999; 
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM6_Init(void);
+
+void StartSensorTask(void *argument);
+void StartBuzzerTask(void *argument);
+
 uint32_t micros(void);
+void delay_us(uint16_t us);
 
-/**
- * @brief  Main function (Entry point)
- * This is where HAL, Clock, and Peripherals would be initialized,
- * and FreeRTOS tasks would be created.
- */
 int main(void)
 {
-  /* HAL Init, System Clock Config... */
-  // HAL_Init();
-  // SystemClock_Config();
+  HAL_Init();
+  SystemClock_Config();
 
-  /* Initialize Peripherals (GPIO, TIM2, TIM6)... */
-  // MX_GPIO_Init();
-  // MX_TIM2_Init(); // PWM for Buzzer
-  // MX_TIM6_Init(); // Timer for micros()
+  // Initializam pinii si timerele configurate din CubeMX
+  MX_GPIO_Init();
+  MX_TIM2_Init();
+  MX_TIM6_Init();
 
-  /* Initialize FreeRTOS Kernel */
-  // osKernelInitialize();
+  // Pornim PWM-ul si timer-ul pt microsecunde inainte de RTOS
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  HAL_TIM_Base_Start(&htim6);
 
-  /* Create Tasks */
-  // As per the PDF, we have two tasks:
-  // osThreadNew(StartTrigTask, NULL, NULL); // Task to send the TRIG pulse
-  // osThreadNew(StartMeasureTask, NULL, NULL); // Task to measure and control the buzzer
+  osKernelInitialize();
 
-  /* Start FreeRTOS Kernel */
-  // osKernelStart();
+  // Am impartit logica in 2 task-uri separate ca sa respectam principiile RTOS
+  sensorTaskHandle = osThreadNew(StartSensorTask, NULL, NULL);
+  buzzerTaskHandle = osThreadNew(StartBuzzerTask, NULL, NULL);
 
-  /* Should not reach here */
+  osKernelStart();
+
   while (1)
   {
+    // Aici nu ajunge niciodata daca RTOS-ul a pornit cu succes
   }
 }
 
-/**
- * @brief Helper function to get time in microseconds
- * Uses a 32-bit timer (TIM6).
- */
-uint32_t micros(void)
+// ---------------- Configurari Hardware (Generate) ----------------
+
+void SystemClock_Config(void)
 {
-  return _HAL_TIM_GET_COUNTER(&htim6);
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) { Error_Handler(); }
 }
 
-/**
- * @brief Task that sends the TRIG pulse to the HC-SR04 sensor
- * Runs every 60ms.
- */
-void StartTrigTask(void *argument)
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  // PA9 e pinul de TRIG (il facem output)
+  GPIO_InitStruct.Pin = GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  // PA8 e pinul de ECHO (il facem input sa citim raspunsul)
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+static void MX_TIM2_Init(void)
+{
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  __HAL_RCC_TIM2_CLK_ENABLE();
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 8 - 1;   
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 1000 - 1;   
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) { Error_Handler(); }
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;  // initial tinem buzzerul oprit
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) { Error_Handler(); }
+
+  // PA1 - Buzzer
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+static void MX_TIM6_Init(void)
+{
+  __HAL_RCC_TIM6_CLK_ENABLE();
+
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 8 - 1;  
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 0xFFFF;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK) { Error_Handler(); }
+}
+
+// ---------------- Functii Utilitare ----------------
+
+// Functie care ne da timpul in microsecunde folosind timerul 6
+uint32_t micros(void)
+{
+  return __HAL_TIM_GET_COUNTER(&htim6);
+}
+
+// Oprim executia cateva microsecunde (folositor pentru pulsul scurt de la senzor)
+void delay_us(uint16_t us)
+{
+  uint32_t start = micros();
+  while ((micros() - start) < us);
+}
+
+// ---------------- Task-uri FreeRTOS ----------------
+
+// Task-ul asta doar se ocupa de senzor si calculeaza distanta
+void StartSensorTask(void *argument)
 {
   for (;;)
   {
-    // Send a 10us pulse (PDF showed 1ms, but 10us is standard)
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET); // TRIG HIGH
-    osDelay(1); // 1ms delay (or use a dedicated microsecond delay)
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_RESET); // TRIG LOW
-    
-    // Wait 60ms for the next pulse
+    // Dam un puls scurt de 10us ca sa declansam senzorul HC-SR04
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);
+    delay_us(10); 
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_RESET);
+
+    // Asteptam sa se faca ECHO 1. Am pus si un timeout ca sa nu se blocheze programul daca pateste ceva senzorul
+    uint32_t timeout = micros();
+    while(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET) {
+        if (micros() - timeout > 50000) break; 
+    }
+
+    uint32_t start = micros();
+
+    // Asteptam sa se faca la loc 0 ca sa vedem cat a durat pulsul
+    timeout = micros();
+    while(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_SET) {
+        if (micros() - timeout > 50000) break; 
+    }
+
+    uint32_t stop = micros();
+    uint32_t duration = stop - start;
+
+    // Formula din datasheet pt HC-SR04 ca sa aflam distanta in cm
+    current_distance_cm = duration / 58;
+
+    // Punem o pauza de 60ms intre masuratori ca sa se linisteasca senzorul (recomandat)
     osDelay(60); 
   }
 }
 
-/**
- * @brief Task that reads the ECHO pin and controls the buzzer
- * based on the measured distance.
- */
-void StartMeasureTask(void *argument)
+// Task-ul asta ia distanta si face galagie din buzzer in functie de ea
+void StartBuzzerTask(void *argument)
 {
-  uint32_t t_start = 0;
-  uint32_t t_stop = 0;
-  uint32_t t_duration = 0;
-  uint32_t distance_cm = 0;
-
   for (;;)
   {
-    // 1. Wait for the ECHO pin to go HIGH
-    while(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET);
-    t_start = micros();
-    
-    // 2. Wait for the ECHO pin to go back to LOW
-    while(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_SET);
-    t_stop = micros();
+    // Ne salvam distanta local ca sa o verificam
+    uint32_t distance = current_distance_cm;
 
-    // 3. Calculate duration and distance
-    t_duration = t_stop - t_start;
-    distance_cm = t_duration / 58; // Formula for HC-SR04
+    if (distance <= 5)
+    {
+      // Daca e super aproape, tiuie continuu
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
+      osDelay(50);
+    }
+    else if (distance <= 10)
+    {
+      // Bipaie foarte des
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
+      osDelay(70);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+      osDelay(70);
+    }
+    else if (distance <= 20)
+    {
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
+      osDelay(90);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+      osDelay(150);
+    }
+    else if (distance <= 30)
+    {
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
+      osDelay(100);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+      osDelay(250);
+    }
+    else if (distance <= 50)
+    {
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
+      osDelay(100);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+      osDelay(400);
+    }
+    else if (distance <= 70)
+    {
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
+      osDelay(50);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+      osDelay(700);
+    }
+    else if (distance <= 100)
+    {
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
+      osDelay(50);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+      osDelay(1000);
+    }
+    else
+    {
+      // Suntem departe (> 1m), oprim buzzerul de tot
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+      osDelay(100);
+    }
+  }
+}
 
-    /* 4. Buzzer Beep Logic */
-    // Based on distance, toggle the PWM on TIM2
-    
-    if (distance_cm <= 10) // Very short distance
-    {
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500); // Sound On
-        osDelay(70);
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0); // Sound Off
-        osDelay(70);
-    }
-    else if (distance_cm <= 20)
-    {
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
-        osDelay(90);
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
-        osDelay(150);
-    }
-    else if (distance_cm <= 30)
-    {
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
-        osDelay(100);
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
-        osDelay(250);
-    }
-    else if (distance_cm <= 50) // Medium distance
-    {
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
-        osDelay(100);
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
-        osDelay(400);
-    }
-    else if (distance_cm <= 70) // Long distance
-    {
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
-        osDelay(50);
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
-        osDelay(700);
-    }
-    else if (distance_cm <= 100)
-    {
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
-        osDelay(50);
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
-        osDelay(1000);
-    }
-    else // Too far, no sound
-    {
-        HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
-        osDelay(100); // Small delay to not overwhelm the task
-    }
+void Error_Handler(void)
+{
+  while (1)
+  {
   }
 }
